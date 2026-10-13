@@ -37,6 +37,7 @@ def number(row,key):
 def build():
     stats,w1,t1=read_csv(STAT_URL,f'player_{SEASON}.csv')
     games,w2,t2=read_csv(GAMES_URL,'games.csv')
+    all_stats=[r for r in stats if str(r.get('season'))==str(SEASON) and r.get('season_type')=='REG' and r.get('player_id')]
     stats=[r for r in stats if str(r.get('season'))==str(SEASON) and r.get('season_type')=='REG' and r.get('position') in ('QB','RB','WR','TE') and r.get('player_id')]
     byid={}; defensive={}; maxweek=0
     fields=['passing_yards','passing_tds','attempts','completions','passing_interceptions','carries','rushing_yards','rushing_tds','receptions','targets','receiving_yards','receiving_tds']
@@ -84,7 +85,60 @@ def build():
             samples=sorted((v for (wk,pos),v in entries.items() if pos==position),key=lambda x:x['week'])[-5:]
             if samples:
                 defense.append({'team':team,'position':position,'weeks':len(samples),'yards_pg':round(sum(x['yards'] for x in samples)/len(samples),1),'td_pg':round(sum(x['tds'] for x in samples)/len(samples),2),'receptions_pg':round(sum(x['receptions'] for x in samples)/len(samples),1)})
-    return {'season':SEASON,'latest_week':maxweek,'next_week':nextweek,'updated_at':datetime.now(timezone.utc).isoformat(),'source_updated_at':{'players':t1,'schedules':t2},'warnings':[x for x in (w1,w2) if x],'players':players,'defense':defense,'next_games':nextgames,'definitions':{'defense':'Last five completed team games; QB passing yards, RB rushing yards, WR/TE receiving yards allowed to the entire position group. Values for RB/WR/TE are group totals, not individual-player yards.','rank':'Highest season total by selected metric.','games':'Regular season only. Games missed are excluded from player per-game averages.'}}
+    # Team profiles: game results from schedule, player-derived yardage from weekly logs.
+    # Avoid counting receiving and passing yards twice: passing from QBs, rushing from all player positions.
+    team_week={}
+    for r in all_stats:
+        try: wk=int(r.get('week') or 0)
+        except (TypeError,ValueError):continue
+        team=r.get('team','')
+        if not team or wk<=0:continue
+        d=team_week.setdefault((team,wk),{'pass_yards':0,'rush_yards':0,'pass_tds':0,'rush_tds':0,'attempts':0,'carries':0})
+        if r.get('position')=='QB':
+            d['pass_yards']+=number(r,'passing_yards')
+            d['pass_tds']+=number(r,'passing_tds')
+            d['attempts']+=number(r,'attempts')
+        d['rush_yards']+=number(r,'rushing_yards')
+        d['rush_tds']+=number(r,'rushing_tds')
+        d['carries']+=number(r,'carries')
+    team_games={}
+    for g in games:
+        if str(g.get('season'))!=str(SEASON) or g.get('game_type')!='REG':continue
+        try: wk=int(g.get('week') or 0)
+        except (TypeError,ValueError):continue
+        away,home=g.get('away_team',''),g.get('home_team','')
+        try:
+            hs=float(g['home_score']);aws=float(g['away_score'])
+        except (ValueError,TypeError,KeyError):continue
+        if not home or not away or wk>maxweek:continue
+        for team,opp,pts,opppts,venue in ((home,away,hs,aws,'home'),(away,home,aws,hs,'away')):
+            if (team,wk) not in team_week:continue
+            own=team_week[(team,wk)];their=team_week.get((opp,wk),{})
+            record={'week':wk,'opponent':opp,'venue':venue,'points':pts,'points_allowed':opppts,
+                'pass_yards':own['pass_yards'],'rush_yards':own['rush_yards'],
+                'total_yards':own['pass_yards']+own['rush_yards'],
+                'pass_tds':own['pass_tds'],'rush_tds':own['rush_tds'],
+                'pass_yards_allowed':their.get('pass_yards'),
+                'rush_yards_allowed':their.get('rush_yards'),
+                'total_yards_allowed':their.get('pass_yards',0)+their.get('rush_yards',0) if their else None,
+                'rush_tds_allowed':their.get('rush_tds')}
+            team_games.setdefault(team,[]).append(record)
+    profile_fields=('points','points_allowed','pass_yards','rush_yards','total_yards','pass_yards_allowed','rush_yards_allowed','total_yards_allowed','rush_tds','rush_tds_allowed')
+    profiles=[]
+    for team,logs in sorted(team_games.items()):
+        logs.sort(key=lambda r:r['week'])
+        def average(rows,k):
+            valid=[r[k] for r in rows if r.get(k) is not None]
+            return round(sum(valid)/len(valid),1) if valid else None
+        profiles.append({'team':team,'games':logs,'played':len(logs),'wins':sum(r['points']>r['points_allowed'] for r in logs),
+            'losses':sum(r['points']<r['points_allowed'] for r in logs),'ties':sum(r['points']==r['points_allowed'] for r in logs),
+            'season':{k:average(logs,k) for k in profile_fields},'last5':{k:average(logs[-5:],k) for k in profile_fields},
+            'next_opponent':opponent.get(team,'BYE / TBD')})
+    # Defensive rush: two distinct definitions are provided, all opposing rushers and RBs only.
+    rb_allowed={(d['team']):d['yards_pg'] for d in defense if d['position']=='RB'}
+    for profile in profiles:
+        profile['rb_rush_allowed_last5_pg']=rb_allowed.get(profile['team'])
+    return {'season':SEASON,'latest_week':maxweek,'next_week':nextweek,'updated_at':datetime.now(timezone.utc).isoformat(),'source_updated_at':{'players':t1,'schedules':t2},'warnings':[x for x in (w1,w2) if x],'players':players,'defense':defense,'teams':profiles,'next_games':nextgames,'definitions':{'defense':'Last five completed team games; QB passing yards, RB rushing yards, WR/TE receiving yards allowed to the entire position group. Values for RB/WR/TE are group totals, not individual-player yards.','team_profiles':'Team scores from completed schedule games. Player-derived passing is QB passing; total rush includes all positions in the weekly player feed, not just RBs. Opponent yardage requires complete opponent feed and may differ from official net team offense due to sacks or stat conventions.','rank':'Highest season total by selected metric.','games':'Regular season only. Games missed are excluded from player per-game averages.'}}
 
 class Handler(BaseHTTPRequestHandler):
     def respond(self,code,body,content_type):
